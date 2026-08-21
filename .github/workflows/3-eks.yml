@@ -1,0 +1,128 @@
+name: Deploy EKS Infrastructure
+
+run-name: EKS infrastructure — ${{ inputs.operation }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Select the Terraform operation
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: terraform-eks-state
+  cancel-in-progress: false
+
+jobs:
+  deploy_eks:
+    name: Terraform EKS
+    environment: dev #edit with your environment name
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+
+      TF_WORKING_DIRECTORY: terraform/eks-setup
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+      TF_VAR_project_name: ${{ vars.PROJECT_NAME }}
+      TF_VAR_environment: ${{ vars.ENVIRONMENT }}
+
+      TF_VAR_terraform_state_bucket: ${{ vars.TF_STATE_BUCKET }}
+      TF_VAR_foundation_state_key: ${{ vars.TF_FOUNDATION_STATE_KEY }}
+
+      TF_VAR_github_deployment_role_arn: ${{ vars.AWS_DEPLOYMENT_ROLE_ARN }}
+
+      TF_VAR_kubernetes_version: ${{ vars.KUBERNETES_VERSION }}
+      TF_VAR_eks_public_access_cidrs: '["0.0.0.0/0"]'
+
+      TF_VAR_eks_node_instance_types: '["t3.medium"]'
+      TF_VAR_eks_node_capacity_type: "ON_DEMAND"
+      TF_VAR_eks_node_disk_size: "20"
+
+      TF_VAR_eks_node_desired_size: "2"
+      TF_VAR_eks_node_min_size: "2"
+      TF_VAR_eks_node_max_size: "4"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYMENT_ROLE_ARN }}
+          role-session-name: github-eks-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform initialize
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.TF_EKS_STATE_KEY }}" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform format check
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform validate
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        run: terraform validate
+
+      - name: Run Terraform action
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        shell: bash
+        run: |
+          if [ "${{ inputs.operation }}" = "plan" ]; then
+            terraform plan -lock-timeout=5m
+          else
+            terraform "${{ inputs.operation }}" \
+              -lock-timeout=5m \
+              -auto-approve
+          fi
+
+      - name: Configure kubectl
+        if: inputs.operation == 'apply'
+        shell: bash
+        run: |
+          CLUSTER_NAME="$(
+            terraform \
+              -chdir="${TF_WORKING_DIRECTORY}" \
+              output -raw eks_cluster_name
+          )"
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${CLUSTER_NAME}"
+
+      - name: Verify EKS cluster
+        if: inputs.operation == 'apply'
+        run: |
+          kubectl get nodes
+          kubectl get namespaces
+
+      - name: Show Terraform outputs
+        if: inputs.operation == 'apply'
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        run: terraform output

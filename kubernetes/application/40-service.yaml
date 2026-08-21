@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${KUBERNETES_APP_NAME}
+  namespace: ${APPLICATION_NAMESPACE}
+  labels:
+    app: ${KUBERNETES_APP_NAME}
+    app.kubernetes.io/name: ${KUBERNETES_APP_NAME}
+    app.kubernetes.io/part-of: ${KUBERNETES_APP_NAME}
+spec:
+  type: ClusterIP
+
+  selector:
+    app: ${KUBERNETES_APP_NAME}
+
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

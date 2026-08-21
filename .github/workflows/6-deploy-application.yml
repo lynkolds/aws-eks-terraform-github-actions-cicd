@@ -1,0 +1,637 @@
+name: Deploy EKS Application
+
+run-name: >- 
+  ${{ inputs.operation == 'deploy' 
+  && format('Deploy application — {0}', inputs.image_tag) 
+  || 'Destroy application' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Select the Kubernetes deployment operation
+        required: true
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - destroy
+
+      image_tag:
+        description: ECR image tag to deploy; ignored during destroy
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: eks-application-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy_application:
+    name: Deploy Kubernetes Application
+    environment: dev # Edit with your GitHub Environment name
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+
+      # Existing external application resources.
+      DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+      CERTIFICATE_ARN: ${{ vars.CERTIFICATE_ARN }}
+
+      # Selected container image tag.
+      IMAGE_TAG: ${{ inputs.image_tag }}
+
+      # Terraform roots whose existing states are read by this workflow.
+      FOUNDATION_TF_WORKING_DIRECTORY: terraform/foundation
+      EKS_TF_WORKING_DIRECTORY: terraform/eks-setup
+      PLATFORM_TF_WORKING_DIRECTORY: terraform/platform
+
+      # Version-controlled Kubernetes manifest templates.
+      KUBERNETES_MANIFEST_DIRECTORY: kubernetes/application
+
+      # Temporary rendered manifests.
+      RENDERED_MANIFEST_DIRECTORY: rendered-kubernetes
+
+      # Kubernetes-safe internal application name.
+      KUBERNETES_APP_NAME: ${{ vars.PROJECT_NAME }}-${{ vars.ENVIRONMENT }}-application
+
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+
+    steps:
+      # ----------------------------------------------------------
+      # Check out the repository
+      # ----------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # ----------------------------------------------------------
+      # Authenticate to AWS through GitHub OIDC
+      # ----------------------------------------------------------
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYMENT_ROLE_ARN }}
+          role-session-name: github-application-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ----------------------------------------------------------
+      # Install Terraform
+      #
+      # Terraform is used only to read outputs from existing states.
+      # This workflow does not run terraform plan or apply.
+      # ----------------------------------------------------------
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+
+      # ----------------------------------------------------------
+      # Initialize the existing EKS Terraform state
+      # ----------------------------------------------------------
+
+      - name: Initialize EKS Terraform state
+        working-directory: ${{ env.EKS_TF_WORKING_DIRECTORY }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.TF_EKS_STATE_KEY }}" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      # ----------------------------------------------------------
+      # Initialize the existing foundation Terraform state
+      # ----------------------------------------------------------
+
+      - name: Initialize foundation Terraform state
+        working-directory: ${{ env.FOUNDATION_TF_WORKING_DIRECTORY }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.TF_FOUNDATION_STATE_KEY }}" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      # ----------------------------------------------------------
+      # Initialize the existing platform Terraform state
+      #
+      # The application deployment occurs after the platform apply,
+      # so this state already exists on the first application run.
+      # ----------------------------------------------------------
+
+      - name: Initialize platform Terraform state
+        working-directory: ${{ env.PLATFORM_TF_WORKING_DIRECTORY }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.TF_PLATFORM_STATE_KEY }}" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      # ----------------------------------------------------------
+      # Read exact infrastructure identifiers from Terraform
+      # ----------------------------------------------------------
+
+      - name: Read Terraform outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EKS_CLUSTER_NAME="$(
+            terraform \
+              -chdir="${EKS_TF_WORKING_DIRECTORY}" \
+              output -raw eks_cluster_name
+          )"
+
+          ECR_REPOSITORY_URL="$(
+            terraform \
+              -chdir="${FOUNDATION_TF_WORKING_DIRECTORY}" \
+              output -raw ecr_repository_url
+          )"
+
+          APPLICATION_SECRET_ARN="$(
+            terraform \
+              -chdir="${FOUNDATION_TF_WORKING_DIRECTORY}" \
+              output -raw application_secret_arn
+          )"
+
+          APPLICATION_NAMESPACE="$(
+            terraform \
+              -chdir="${PLATFORM_TF_WORKING_DIRECTORY}" \
+              output -raw application_namespace
+          )"
+
+          APPLICATION_SERVICE_ACCOUNT="$(
+            terraform \
+              -chdir="${PLATFORM_TF_WORKING_DIRECTORY}" \
+              output -raw application_service_account
+          )"
+
+          IMAGE_URI=""
+          ECR_REPOSITORY_NAME="${ECR_REPOSITORY_URL#*/}"
+
+          if [ "${{ inputs.operation }}" = "deploy" ]; then
+            IMAGE_URI="${ECR_REPOSITORY_URL}:${IMAGE_TAG}"
+          fi
+
+          echo "EKS_CLUSTER_NAME=${EKS_CLUSTER_NAME}" >> "$GITHUB_ENV"
+          echo "ECR_REPOSITORY_URL=${ECR_REPOSITORY_URL}" >> "$GITHUB_ENV"
+          echo "ECR_REPOSITORY_NAME=${ECR_REPOSITORY_NAME}" >> "$GITHUB_ENV"
+          echo "APPLICATION_SECRET_ARN=${APPLICATION_SECRET_ARN}" >> "$GITHUB_ENV"
+          echo "APPLICATION_NAMESPACE=${APPLICATION_NAMESPACE}" >> "$GITHUB_ENV"
+          echo "APPLICATION_SERVICE_ACCOUNT=${APPLICATION_SERVICE_ACCOUNT}" >> "$GITHUB_ENV"
+          echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
+
+      # ----------------------------------------------------------
+      # Validate required deployment values
+      # ----------------------------------------------------------
+
+      - name: Validate deployment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COMMON_REQUIRED_VARIABLES=(
+            AWS_REGION
+            EKS_CLUSTER_NAME
+            APPLICATION_NAMESPACE
+            APPLICATION_SERVICE_ACCOUNT
+            KUBERNETES_APP_NAME
+          )
+
+          for VARIABLE_NAME in "${COMMON_REQUIRED_VARIABLES[@]}"; do
+            if [ -z "${!VARIABLE_NAME:-}" ]; then
+              echo "${VARIABLE_NAME} is not configured."
+              exit 1
+            fi
+          done
+
+          if [ "${{ inputs.operation }}" = "deploy" ]; then
+            DEPLOY_REQUIRED_VARIABLES=(
+              ECR_REPOSITORY_URL
+              APPLICATION_SECRET_ARN
+              DOMAIN_NAME
+              CERTIFICATE_ARN
+              IMAGE_TAG
+              IMAGE_URI
+            )
+
+            for VARIABLE_NAME in "${DEPLOY_REQUIRED_VARIABLES[@]}"; do
+              if [ -z "${!VARIABLE_NAME:-}" ]; then
+                echo "${VARIABLE_NAME} is not configured."
+                exit 1
+              fi
+            done
+
+            if [[ "${IMAGE_TAG}" == *:* ]]; then
+              echo "Enter only the image tag, such as v2, not a complete image URI."
+              exit 1
+            fi
+          fi
+
+      # ----------------------------------------------------------
+      # Configure kubectl for the exact EKS cluster
+      # ----------------------------------------------------------
+
+      - name: Configure kubectl
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}"
+
+      # ----------------------------------------------------------
+      # Confirm that the GitHub role can access Kubernetes
+      # ----------------------------------------------------------
+
+      - name: Verify Kubernetes API access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl get nodes
+          kubectl get namespaces
+
+      # ----------------------------------------------------------
+      # Confirm that the required platform add-ons exist
+      #
+      # This prevents an application deployment when Pod Identity,
+      # secret mounting, or ALB creation cannot work.
+      # ----------------------------------------------------------
+
+      - name: Verify required platform add-ons
+        if: inputs.operation == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl get daemonset \
+            eks-pod-identity-agent \
+            --namespace kube-system
+
+          kubectl get daemonset \
+            --namespace kube-system \
+            -l app=secrets-store-csi-driver
+
+          kubectl get daemonset \
+            --namespace kube-system \
+            -l app=secrets-store-csi-driver-provider-aws
+
+          kubectl get deployment \
+            aws-load-balancer-controller \
+            --namespace kube-system
+
+          kubectl get deployment \
+            external-dns \
+            --namespace external-dns
+
+          kubectl get deployment \
+            metrics-server \
+            --namespace kube-system
+
+          kubectl wait \
+            --for=condition=Available \
+            deployment \
+            --namespace kube-system \
+            -l app.kubernetes.io/instance=cluster-autoscaler \
+            --timeout=120s
+
+          kubectl get deployment \
+            --namespace kube-system \
+            -l app.kubernetes.io/instance=cluster-autoscaler
+
+      # ----------------------------------------------------------
+      # Confirm that the requested image exists in ECR
+      # ----------------------------------------------------------
+
+      - name: Verify ECR image
+        if: inputs.operation == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY_NAME}" \
+            --image-ids imageTag="${IMAGE_TAG}" \
+            --region "${AWS_REGION}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text \
+            > /dev/null
+
+          echo "Verified ECR image: ${IMAGE_URI}"
+
+      # ----------------------------------------------------------
+      # Confirm that the Secrets Manager secret has a current value
+      #
+      # The secret value itself is not printed.
+      # ----------------------------------------------------------
+
+      - name: Verify application secret
+        if: inputs.operation == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws secretsmanager get-secret-value \
+            --secret-id "${APPLICATION_SECRET_ARN}" \
+            --region "${AWS_REGION}" \
+            --query 'VersionId' \
+            --output text \
+            > /dev/null
+
+          echo "The application secret contains a current secret version."
+
+      # ----------------------------------------------------------
+      # Install envsubst for rendering manifest templates
+      # ----------------------------------------------------------
+
+      - name: Install manifest rendering dependency
+        if: inputs.operation == 'deploy'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gettext-base
+
+      # ----------------------------------------------------------
+      # Render the Kubernetes manifest templates
+      #
+      # Only the explicitly listed variables are substituted.
+      # This prevents accidental replacement of unrelated shell
+      # variables that might appear inside a manifest.
+      # ----------------------------------------------------------
+
+      - name: Render Kubernetes manifests
+        if: inputs.operation == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUIRED_MANIFESTS=(
+            00-namespace.yaml
+            10-service-account.yaml
+            20-secret-provider-class.yaml
+            30-deployment.yaml
+            40-service.yaml
+            50-ingress.yaml
+            60-horizontal-pod-autoscaler.yaml
+          )
+
+          rm -rf "${RENDERED_MANIFEST_DIRECTORY}"
+          mkdir -p "${RENDERED_MANIFEST_DIRECTORY}"
+
+          for MANIFEST in "${REQUIRED_MANIFESTS[@]}"; do
+            SOURCE_FILE="${KUBERNETES_MANIFEST_DIRECTORY}/${MANIFEST}"
+            DESTINATION_FILE="${RENDERED_MANIFEST_DIRECTORY}/${MANIFEST}"
+
+            if [ ! -f "${SOURCE_FILE}" ]; then
+              echo "Required manifest was not found: ${SOURCE_FILE}"
+              exit 1
+            fi
+
+            envsubst \
+              '${KUBERNETES_APP_NAME}
+               ${APPLICATION_NAMESPACE}
+               ${APPLICATION_SERVICE_ACCOUNT}
+               ${APPLICATION_SECRET_ARN}
+               ${IMAGE_URI}
+               ${DOMAIN_NAME}
+               ${CERTIFICATE_ARN}' \
+              < "${SOURCE_FILE}" \
+              > "${DESTINATION_FILE}"
+          done
+
+      # ----------------------------------------------------------
+      # Validate all rendered manifests before changing live resources
+      # ----------------------------------------------------------
+
+      - name: Validate rendered Kubernetes manifests
+        if: inputs.operation == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl apply \
+            --dry-run=client \
+            -f "${RENDERED_MANIFEST_DIRECTORY}"
+
+      # ----------------------------------------------------------
+      # Deploy the Kubernetes resources in dependency order
+      # ----------------------------------------------------------
+
+      - name: Deploy application
+        if: inputs.operation == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl apply \
+            -f "${RENDERED_MANIFEST_DIRECTORY}/00-namespace.yaml"
+
+          kubectl apply \
+            -f "${RENDERED_MANIFEST_DIRECTORY}/10-service-account.yaml"
+
+          kubectl apply \
+            -f "${RENDERED_MANIFEST_DIRECTORY}/20-secret-provider-class.yaml"
+
+          kubectl apply \
+            -f "${RENDERED_MANIFEST_DIRECTORY}/30-deployment.yaml"
+
+          kubectl apply \
+            -f "${RENDERED_MANIFEST_DIRECTORY}/60-horizontal-pod-autoscaler.yaml"
+
+          kubectl apply \
+            -f "${RENDERED_MANIFEST_DIRECTORY}/40-service.yaml"
+
+          kubectl apply \
+            -f "${RENDERED_MANIFEST_DIRECTORY}/50-ingress.yaml"
+
+      # ----------------------------------------------------------
+      # Verify the application rollout
+      # ----------------------------------------------------------
+
+      - name: Verify application rollout
+        if: inputs.operation == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl rollout status \
+            deployment/"${KUBERNETES_APP_NAME}" \
+            --namespace "${APPLICATION_NAMESPACE}" \
+            --timeout=10m
+
+          kubectl get pods \
+            --namespace "${APPLICATION_NAMESPACE}" \
+            --selector "app=${KUBERNETES_APP_NAME}" \
+            --output wide
+
+          kubectl get service \
+            "${KUBERNETES_APP_NAME}" \
+            --namespace "${APPLICATION_NAMESPACE}"
+
+          kubectl get secret \
+            "${KUBERNETES_APP_NAME}-secrets" \
+            --namespace "${APPLICATION_NAMESPACE}"
+
+          HPA_CPU_UTILIZATION=""
+
+          for ATTEMPT in {1..30}; do
+            HPA_CPU_UTILIZATION="$(
+              kubectl get horizontalpodautoscaler \
+                "${KUBERNETES_APP_NAME}" \
+                --namespace "${APPLICATION_NAMESPACE}" \
+                --output jsonpath='{.status.currentMetrics[0].resource.current.averageUtilization}' \
+                2>/dev/null || true
+            )"
+
+            if [ -n "${HPA_CPU_UTILIZATION}" ]; then
+              break
+            fi
+
+            sleep 10
+          done
+
+          if [ -z "${HPA_CPU_UTILIZATION}" ]; then
+            echo "The Horizontal Pod Autoscaler did not receive CPU metrics."
+            kubectl describe horizontalpodautoscaler \
+              "${KUBERNETES_APP_NAME}" \
+              --namespace "${APPLICATION_NAMESPACE}"
+            exit 1
+          fi
+
+          kubectl get horizontalpodautoscaler \
+            "${KUBERNETES_APP_NAME}" \
+            --namespace "${APPLICATION_NAMESPACE}"
+
+          echo "HPA CPU utilization: ${HPA_CPU_UTILIZATION}%"
+
+      # ----------------------------------------------------------
+      # Wait for the AWS Load Balancer Controller to assign an ALB
+      # ----------------------------------------------------------
+
+      - name: Verify application ingress and DNS
+        if: inputs.operation == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ALB_HOSTNAME=""
+
+          for ATTEMPT in {1..60}; do
+            ALB_HOSTNAME="$(
+              kubectl get ingress \
+                "${KUBERNETES_APP_NAME}" \
+                --namespace "${APPLICATION_NAMESPACE}" \
+                --output jsonpath='{.status.loadBalancer.ingress[0].hostname}' \
+                2>/dev/null || true
+            )"
+
+            if [ -n "${ALB_HOSTNAME}" ]; then
+              break
+            fi
+
+            sleep 10
+          done
+
+          if [ -z "${ALB_HOSTNAME}" ]; then
+            echo "The ALB hostname was not assigned."
+            kubectl describe ingress \
+              "${KUBERNETES_APP_NAME}" \
+              --namespace "${APPLICATION_NAMESPACE}"
+            exit 1
+          fi
+
+          echo "ALB hostname: ${ALB_HOSTNAME}"
+
+          DOMAIN_RESOLUTION=""
+
+          for ATTEMPT in {1..60}; do
+            DOMAIN_RESOLUTION="$(getent ahosts "${DOMAIN_NAME}" | head -n 1 || true)"
+
+            if [ -n "${DOMAIN_RESOLUTION}" ]; then
+              break
+            fi
+
+            sleep 10
+          done
+
+          if [ -z "${DOMAIN_RESOLUTION}" ]; then
+            echo "The domain has not resolved yet: ${DOMAIN_NAME}"
+            kubectl logs \
+              deployment/external-dns \
+              --namespace external-dns \
+              --tail=100
+            exit 1
+          fi
+
+          echo "DNS resolution confirmed: ${DOMAIN_NAME}"
+          echo "Application URL: https://${DOMAIN_NAME}"
+
+      # ----------------------------------------------------------
+      # Remove application resources in reverse dependency order
+      #
+      # Run this before destroying the platform or EKS states.
+      # ----------------------------------------------------------
+
+      - name: Destroy application
+        if: inputs.operation == 'destroy'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl delete horizontalpodautoscaler \
+            "${KUBERNETES_APP_NAME}" \
+            --namespace "${APPLICATION_NAMESPACE}" \
+            --ignore-not-found=true
+
+          kubectl delete ingress \
+            "${KUBERNETES_APP_NAME}" \
+            --namespace "${APPLICATION_NAMESPACE}" \
+            --ignore-not-found=true
+
+          kubectl delete service \
+            "${KUBERNETES_APP_NAME}" \
+            --namespace "${APPLICATION_NAMESPACE}" \
+            --ignore-not-found=true
+
+          kubectl delete deployment \
+            "${KUBERNETES_APP_NAME}" \
+            --namespace "${APPLICATION_NAMESPACE}" \
+            --ignore-not-found=true
+
+          kubectl delete secretproviderclass \
+            "${KUBERNETES_APP_NAME}-secrets" \
+            --namespace "${APPLICATION_NAMESPACE}" \
+            --ignore-not-found=true
+
+          kubectl delete serviceaccount \
+            "${APPLICATION_SERVICE_ACCOUNT}" \
+            --namespace "${APPLICATION_NAMESPACE}" \
+            --ignore-not-found=true
+
+          kubectl delete namespace \
+            "${APPLICATION_NAMESPACE}" \
+            --ignore-not-found=true
+
+      # ----------------------------------------------------------
+      # Remove temporary rendered files
+      # ----------------------------------------------------------
+
+      - name: Remove rendered manifests
+        if: always()
+        shell: bash
+        run: rm -rf "${RENDERED_MANIFEST_DIRECTORY}"

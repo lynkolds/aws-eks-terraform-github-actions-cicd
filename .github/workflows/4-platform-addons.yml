@@ -1,0 +1,895 @@
+name: Install EKS Platform Add-ons
+
+run-name: EKS platform add-ons — ${{ inputs.operation }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Select the Terraform operation
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: terraform-platform-state
+  cancel-in-progress: false
+
+jobs:
+  install_platform_addons:
+    name: Terraform EKS Platform
+    environment: dev # edit with your environment name
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+
+      EKS_TF_WORKING_DIRECTORY: terraform/eks-setup
+      PLATFORM_TF_WORKING_DIRECTORY: terraform/platform
+
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+      TF_VAR_project_name: ${{ vars.PROJECT_NAME }}
+      TF_VAR_environment: ${{ vars.ENVIRONMENT }}
+
+      TF_VAR_terraform_state_bucket: ${{ vars.TF_STATE_BUCKET }}
+      TF_VAR_foundation_state_key: ${{ vars.TF_FOUNDATION_STATE_KEY }}
+      TF_VAR_eks_state_key: ${{ vars.TF_EKS_STATE_KEY }}
+
+      TF_VAR_hosted_zone_name: ${{ vars.HOSTED_ZONE_NAME }}
+      TF_VAR_hosted_zone_id: ${{ vars.HOSTED_ZONE_ID }}
+
+      TF_VAR_application_namespace: "application"
+      TF_VAR_application_service_account: "application-service-account"
+
+      TF_VAR_cluster_autoscaler_namespace: "kube-system"
+      TF_VAR_cluster_autoscaler_service_account: "cluster-autoscaler"
+      TF_VAR_cluster_autoscaler_image_tag: "v1.35.2"
+      TF_VAR_cluster_autoscaler_chart_version: "9.59.0"
+
+      TF_VAR_sns_email: ${{ vars.SNS_EMAIL }}
+      TF_VAR_cloudwatch_observability_addon_version: ${{ vars.CLOUDWATCH_OBSERVABILITY_ADDON_VERSION }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYMENT_ROLE_ARN }}
+          role-session-name: github-platform-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+
+      - name: Initialize EKS Terraform state
+        working-directory: ${{ env.EKS_TF_WORKING_DIRECTORY }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.TF_EKS_STATE_KEY }}" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Read EKS cluster name
+        working-directory: ${{ env.EKS_TF_WORKING_DIRECTORY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CLUSTER_NAME="$(terraform output -raw eks_cluster_name)"
+
+          if [ -z "${CLUSTER_NAME}" ]; then
+            echo "The EKS cluster name could not be read from Terraform state."
+            exit 1
+          fi
+
+          echo "EKS_CLUSTER_NAME=${CLUSTER_NAME}" >> "$GITHUB_ENV"
+          echo "EKS cluster: ${CLUSTER_NAME}"
+
+      - name: Configure kubectl
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}"
+
+      - name: Verify Kubernetes API access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl get nodes
+          kubectl get namespaces
+
+      - name: Terraform initialize
+        working-directory: ${{ env.PLATFORM_TF_WORKING_DIRECTORY }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.TF_PLATFORM_STATE_KEY }}" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform format check
+        working-directory: ${{ env.PLATFORM_TF_WORKING_DIRECTORY }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform validate
+        working-directory: ${{ env.PLATFORM_TF_WORKING_DIRECTORY }}
+        run: terraform validate
+
+      - name: Run Terraform action
+        working-directory: ${{ env.PLATFORM_TF_WORKING_DIRECTORY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ inputs.operation }}" = "plan" ]; then
+            terraform plan -lock-timeout=5m
+          else
+            terraform "${{ inputs.operation }}" \
+              -lock-timeout=5m \
+              -auto-approve
+          fi
+
+      # ==========================================================
+      # VERIFY EKS POD IDENTITY AGENT
+      # ==========================================================
+
+      - name: Verify Pod Identity Agent
+        if: inputs.operation == 'apply'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl get daemonset \
+            eks-pod-identity-agent \
+            --namespace kube-system
+
+      # ==========================================================
+      # REFRESH CLUSTER AUTOSCALER POD IDENTITY
+      #
+      # EKS Pod Identity associations are eventually consistent.
+      #
+      # Terraform creates the association before the Helm release,
+      # but the association may take several seconds to become
+      # effective.
+      #
+      # The workflow therefore:
+      #
+      # 1. Confirms that the association is visible.
+      # 2. Finds the Helm-generated Cluster Autoscaler Deployment.
+      # 3. Recreates the Cluster Autoscaler Pod.
+      # 4. Checks that Pod Identity environment-variable NAMES
+      #    were injected.
+      # 5. Retries if propagation has not completed.
+      #
+      # The actual Pod Identity environment-variable values are
+      # NOT printed.
+      # ==========================================================
+
+      - name: Refresh Cluster Autoscaler Pod Identity
+        if: inputs.operation == 'apply'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NAMESPACE="${TF_VAR_cluster_autoscaler_namespace}"
+          SERVICE_ACCOUNT="${TF_VAR_cluster_autoscaler_service_account}"
+
+          SELECTOR="app.kubernetes.io/name=aws-cluster-autoscaler,app.kubernetes.io/instance=cluster-autoscaler"
+
+          echo "Waiting for Cluster Autoscaler Pod Identity association..."
+
+          ASSOCIATION_ID=""
+
+          for ATTEMPT in {1..12}; do
+
+            ASSOCIATION_ID="$(
+              aws eks list-pod-identity-associations \
+                --cluster-name "${EKS_CLUSTER_NAME}" \
+                --namespace "${NAMESPACE}" \
+                --service-account "${SERVICE_ACCOUNT}" \
+                --region "${AWS_REGION}" \
+                --query 'associations[0].associationId' \
+                --output text \
+                2>/dev/null || true
+            )"
+
+            if [ -n "${ASSOCIATION_ID}" ] && [ "${ASSOCIATION_ID}" != "None" ]; then
+              break
+            fi
+
+            echo "Pod Identity association is not visible yet. Retrying..."
+            sleep 5
+          done
+
+          if [ -z "${ASSOCIATION_ID}" ] || [ "${ASSOCIATION_ID}" = "None" ]; then
+            echo "::error::Cluster Autoscaler Pod Identity association was not found."
+            exit 1
+          fi
+
+          echo "Cluster Autoscaler Pod Identity association is available."
+
+          DEPLOYMENT_NAME="$(
+            kubectl get deployment \
+              --namespace "${NAMESPACE}" \
+              -l "${SELECTOR}" \
+              -o jsonpath='{.items[0].metadata.name}'
+          )"
+
+          if [ -z "${DEPLOYMENT_NAME}" ]; then
+            echo "::error::Cluster Autoscaler Deployment was not found."
+            exit 1
+          fi
+
+          echo "Cluster Autoscaler Deployment: ${DEPLOYMENT_NAME}"
+
+          POD_IDENTITY_READY="false"
+
+          for ATTEMPT in {1..6}; do
+
+            OLD_POD_NAME="$(
+              kubectl get pods \
+                --namespace "${NAMESPACE}" \
+                -l "${SELECTOR}" \
+                --sort-by=.metadata.creationTimestamp \
+                -o jsonpath='{.items[-1].metadata.name}' \
+                2>/dev/null || true
+            )"
+
+            echo "Recreating Cluster Autoscaler Pod..."
+
+            kubectl rollout restart \
+              deployment/"${DEPLOYMENT_NAME}" \
+              --namespace "${NAMESPACE}"
+
+            NEW_POD_NAME=""
+
+            for POD_ATTEMPT in {1..18}; do
+
+              NEW_POD_NAME="$(
+                kubectl get pods \
+                  --namespace "${NAMESPACE}" \
+                  -l "${SELECTOR}" \
+                  --sort-by=.metadata.creationTimestamp \
+                  -o jsonpath='{.items[-1].metadata.name}' \
+                  2>/dev/null || true
+              )"
+
+              if [ -n "${NEW_POD_NAME}" ] && [ "${NEW_POD_NAME}" != "${OLD_POD_NAME}" ]; then
+                break
+              fi
+
+              sleep 5
+            done
+
+            if [ -z "${NEW_POD_NAME}" ] || [ "${NEW_POD_NAME}" = "${OLD_POD_NAME}" ]; then
+              echo "A new Cluster Autoscaler Pod was not detected. Retrying..."
+              continue
+            fi
+
+            echo "New Cluster Autoscaler Pod: ${NEW_POD_NAME}"
+
+            ENVIRONMENT_VARIABLE_NAMES="$(
+              kubectl get pod \
+                "${NEW_POD_NAME}" \
+                --namespace "${NAMESPACE}" \
+                -o jsonpath='{range .spec.containers[*].env[*]}{.name}{"\n"}{end}'
+            )"
+
+            if grep -qx "AWS_CONTAINER_CREDENTIALS_FULL_URI" <<< "${ENVIRONMENT_VARIABLE_NAMES}" \
+              && grep -qx "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE" <<< "${ENVIRONMENT_VARIABLE_NAMES}"; then
+
+              POD_IDENTITY_READY="true"
+
+              echo "Cluster Autoscaler Pod Identity credential configuration was injected."
+              break
+            fi
+
+            echo "Pod Identity credential configuration is not injected yet. Retrying..."
+            sleep 5
+          done
+
+          if [ "${POD_IDENTITY_READY}" != "true" ]; then
+            echo "::error::Cluster Autoscaler did not receive Pod Identity credential configuration."
+            exit 1
+          fi
+
+          echo "Waiting for Cluster Autoscaler rollout..."
+
+          kubectl rollout status \
+            deployment/"${DEPLOYMENT_NAME}" \
+            --namespace "${NAMESPACE}" \
+            --timeout=180s
+
+      # ==========================================================
+      # VERIFY SECRETS STORE CSI DRIVER
+      # ==========================================================
+
+      - name: Verify Secrets Store CSI Driver
+        if: inputs.operation == 'apply'
+        run: |
+          kubectl get daemonset \
+            --namespace kube-system \
+            -l app=secrets-store-csi-driver
+
+      # ==========================================================
+      # VERIFY AWS SECRETS PROVIDER
+      # ==========================================================
+
+      - name: Verify AWS Secrets Provider
+        if: inputs.operation == 'apply'
+        run: |
+          kubectl get daemonset \
+            --namespace kube-system \
+            -l app=secrets-store-csi-driver-provider-aws
+
+      # ==========================================================
+      # VERIFY AWS LOAD BALANCER CONTROLLER
+      # ==========================================================
+
+      - name: Verify AWS Load Balancer Controller
+        if: inputs.operation == 'apply'
+        run: |
+          kubectl get deployment \
+            aws-load-balancer-controller \
+            --namespace kube-system
+
+      # ==========================================================
+      # VERIFY CLUSTER AUTOSCALER
+      #
+      # The Helm chart generates the Deployment name, so the
+      # workflow locates it using stable Helm labels instead of
+      # assuming the Deployment is named "cluster-autoscaler".
+      #
+      # Verification confirms:
+      #
+      # - Deployment exists
+      # - Deployment successfully rolled out
+      # - Pod exists
+      # - Pod is Running
+      # - Container is Ready
+      # - Correct ServiceAccount is used
+      # - Pod Identity environment-variable NAMES are present
+      #
+      # Pod Identity values are NOT printed.
+      # ==========================================================
+
+      - name: Verify Cluster Autoscaler
+        if: inputs.operation == 'apply'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NAMESPACE="${TF_VAR_cluster_autoscaler_namespace}"
+          SERVICE_ACCOUNT="${TF_VAR_cluster_autoscaler_service_account}"
+
+          SELECTOR="app.kubernetes.io/name=aws-cluster-autoscaler,app.kubernetes.io/instance=cluster-autoscaler"
+
+          DEPLOYMENT_NAME="$(
+            kubectl get deployment \
+              --namespace "${NAMESPACE}" \
+              -l "${SELECTOR}" \
+              -o jsonpath='{.items[0].metadata.name}'
+          )"
+
+          if [ -z "${DEPLOYMENT_NAME}" ]; then
+            echo "::error::Cluster Autoscaler Deployment was not found."
+            exit 1
+          fi
+
+          echo "Cluster Autoscaler Deployment: ${DEPLOYMENT_NAME}"
+
+          kubectl rollout status \
+            deployment/"${DEPLOYMENT_NAME}" \
+            --namespace "${NAMESPACE}" \
+            --timeout=180s
+
+          POD_NAME="$(
+            kubectl get pods \
+              --namespace "${NAMESPACE}" \
+              -l "${SELECTOR}" \
+              --sort-by=.metadata.creationTimestamp \
+              -o jsonpath='{.items[-1].metadata.name}'
+          )"
+
+          if [ -z "${POD_NAME}" ]; then
+            echo "::error::Cluster Autoscaler Pod was not found."
+            exit 1
+          fi
+
+          CURRENT_SERVICE_ACCOUNT="$(
+            kubectl get pod \
+              "${POD_NAME}" \
+              --namespace "${NAMESPACE}" \
+              -o jsonpath='{.spec.serviceAccountName}'
+          )"
+
+          if [ "${CURRENT_SERVICE_ACCOUNT}" != "${SERVICE_ACCOUNT}" ]; then
+            echo "::error::Unexpected Cluster Autoscaler ServiceAccount."
+            echo "Expected: ${SERVICE_ACCOUNT}"
+            echo "Actual: ${CURRENT_SERVICE_ACCOUNT}"
+            exit 1
+          fi
+
+          POD_PHASE="$(
+            kubectl get pod \
+              "${POD_NAME}" \
+              --namespace "${NAMESPACE}" \
+              -o jsonpath='{.status.phase}'
+          )"
+
+          if [ "${POD_PHASE}" != "Running" ]; then
+            echo "::error::Cluster Autoscaler Pod is not Running."
+            echo "Current phase: ${POD_PHASE}"
+            exit 1
+          fi
+
+          CONTAINER_READY="$(
+            kubectl get pod \
+              "${POD_NAME}" \
+              --namespace "${NAMESPACE}" \
+              -o jsonpath='{.status.containerStatuses[0].ready}'
+          )"
+
+          if [ "${CONTAINER_READY}" != "true" ]; then
+            echo "::error::Cluster Autoscaler container is not Ready."
+            exit 1
+          fi
+
+          ENVIRONMENT_VARIABLE_NAMES="$(
+            kubectl get pod \
+              "${POD_NAME}" \
+              --namespace "${NAMESPACE}" \
+              -o jsonpath='{range .spec.containers[*].env[*]}{.name}{"\n"}{end}'
+          )"
+
+          if ! grep -qx "AWS_CONTAINER_CREDENTIALS_FULL_URI" <<< "${ENVIRONMENT_VARIABLE_NAMES}"; then
+            echo "::error::AWS_CONTAINER_CREDENTIALS_FULL_URI was not injected."
+            exit 1
+          fi
+
+          if ! grep -qx "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE" <<< "${ENVIRONMENT_VARIABLE_NAMES}"; then
+            echo "::error::AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE was not injected."
+            exit 1
+          fi
+
+          echo "Cluster Autoscaler Deployment:"
+          kubectl get deployment \
+            "${DEPLOYMENT_NAME}" \
+            --namespace "${NAMESPACE}"
+
+          echo "Cluster Autoscaler Pod:"
+          kubectl get pod \
+            "${POD_NAME}" \
+            --namespace "${NAMESPACE}" \
+            -o wide
+
+          echo "Cluster Autoscaler image:"
+          kubectl get pod \
+            "${POD_NAME}" \
+            --namespace "${NAMESPACE}" \
+            -o jsonpath='{.spec.containers[0].image}{"\n"}'
+
+          echo "Cluster Autoscaler verification completed successfully."
+      # ==========================================================
+      # REFRESH EXTERNALDNS POD IDENTITY
+      #
+      # EKS Pod Identity associations are eventually consistent.
+      #
+      # Terraform may create the association successfully before
+      # it is fully effective for newly started Pods.
+      #
+      # The workflow therefore:
+      #
+      # 1. Confirms that the ExternalDNS Pod Identity association
+      #    is visible.
+      # 2. Finds the ExternalDNS Deployment.
+      # 3. Recreates the ExternalDNS Pod.
+      # 4. Checks that the Pod Identity environment-variable NAMES
+      #    were injected.
+      # 5. Retries if propagation has not completed.
+      #
+      # The actual Pod Identity environment-variable values are
+      # NOT printed.
+      # ==========================================================
+
+      - name: Refresh ExternalDNS Pod Identity
+        if: inputs.operation == 'apply'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NAMESPACE="external-dns"
+          SERVICE_ACCOUNT="external-dns"
+          SELECTOR="app.kubernetes.io/instance=external-dns"
+
+          echo "Waiting for ExternalDNS Pod Identity association..."
+
+          ASSOCIATION_ID=""
+
+          for ATTEMPT in {1..12}; do
+
+            ASSOCIATION_ID="$(
+              aws eks list-pod-identity-associations \
+                --cluster-name "${EKS_CLUSTER_NAME}" \
+                --namespace "${NAMESPACE}" \
+                --service-account "${SERVICE_ACCOUNT}" \
+                --region "${AWS_REGION}" \
+                --query 'associations[0].associationId' \
+                --output text \
+                2>/dev/null || true
+            )"
+
+            if [ -n "${ASSOCIATION_ID}" ] && [ "${ASSOCIATION_ID}" != "None" ]; then
+              break
+            fi
+
+            echo "ExternalDNS Pod Identity association is not visible yet. Retrying..."
+            sleep 5
+          done
+
+          if [ -z "${ASSOCIATION_ID}" ] || [ "${ASSOCIATION_ID}" = "None" ]; then
+            echo "::error::ExternalDNS Pod Identity association was not found."
+            exit 1
+          fi
+
+          echo "ExternalDNS Pod Identity association is available."
+
+          DEPLOYMENT_NAME="$(
+            kubectl get deployment \
+              --namespace "${NAMESPACE}" \
+              -l "${SELECTOR}" \
+              -o jsonpath='{.items[0].metadata.name}'
+          )"
+
+          if [ -z "${DEPLOYMENT_NAME}" ]; then
+            echo "::error::ExternalDNS Deployment was not found."
+            exit 1
+          fi
+
+          echo "ExternalDNS Deployment: ${DEPLOYMENT_NAME}"
+
+          POD_IDENTITY_READY="false"
+
+          for ATTEMPT in {1..6}; do
+
+            OLD_POD_NAME="$(
+              kubectl get pods \
+                --namespace "${NAMESPACE}" \
+                -l "${SELECTOR}" \
+                --sort-by=.metadata.creationTimestamp \
+                -o jsonpath='{.items[-1].metadata.name}' \
+                2>/dev/null || true
+            )"
+
+            echo "Recreating ExternalDNS Pod..."
+
+            kubectl rollout restart \
+              deployment/"${DEPLOYMENT_NAME}" \
+              --namespace "${NAMESPACE}"
+
+            NEW_POD_NAME=""
+
+            for POD_ATTEMPT in {1..18}; do
+
+              NEW_POD_NAME="$(
+                kubectl get pods \
+                  --namespace "${NAMESPACE}" \
+                  -l "${SELECTOR}" \
+                  --sort-by=.metadata.creationTimestamp \
+                  -o jsonpath='{.items[-1].metadata.name}' \
+                  2>/dev/null || true
+              )"
+
+              if [ -n "${NEW_POD_NAME}" ] && [ "${NEW_POD_NAME}" != "${OLD_POD_NAME}" ]; then
+                break
+              fi
+
+              sleep 5
+            done
+
+            if [ -z "${NEW_POD_NAME}" ] || [ "${NEW_POD_NAME}" = "${OLD_POD_NAME}" ]; then
+              echo "A new ExternalDNS Pod was not detected. Retrying..."
+              continue
+            fi
+
+            echo "New ExternalDNS Pod: ${NEW_POD_NAME}"
+
+            ENVIRONMENT_VARIABLE_NAMES="$(
+              kubectl get pod \
+                "${NEW_POD_NAME}" \
+                --namespace "${NAMESPACE}" \
+                -o jsonpath='{range .spec.containers[*].env[*]}{.name}{"\n"}{end}'
+            )"
+
+            if grep -qx "AWS_CONTAINER_CREDENTIALS_FULL_URI" <<< "${ENVIRONMENT_VARIABLE_NAMES}" \
+              && grep -qx "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE" <<< "${ENVIRONMENT_VARIABLE_NAMES}"; then
+
+              POD_IDENTITY_READY="true"
+
+              echo "ExternalDNS Pod Identity credential configuration was injected."
+              break
+            fi
+
+            echo "ExternalDNS Pod Identity credential configuration is not injected yet. Retrying..."
+            sleep 5
+          done
+
+          if [ "${POD_IDENTITY_READY}" != "true" ]; then
+            echo "::error::ExternalDNS did not receive Pod Identity credential configuration."
+            exit 1
+          fi
+
+          echo "Waiting for ExternalDNS rollout..."
+
+          kubectl rollout status \
+            deployment/"${DEPLOYMENT_NAME}" \
+            --namespace "${NAMESPACE}" \
+            --timeout=180s
+
+            # ==========================================================
+      # VERIFY EXTERNALDNS
+      #
+      # Verification confirms:
+      #
+      # - Deployment exists
+      # - Deployment successfully rolled out
+      # - Pod exists
+      # - Pod is Running
+      # - Container is Ready
+      # - Correct ServiceAccount is used
+      # - Pod Identity environment-variable NAMES are present
+      #
+      # Pod Identity values are NOT printed.
+      # ==========================================================
+
+      - name: Verify ExternalDNS
+        if: inputs.operation == 'apply'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NAMESPACE="external-dns"
+          SERVICE_ACCOUNT="external-dns"
+          SELECTOR="app.kubernetes.io/instance=external-dns"
+
+          DEPLOYMENT_NAME="$(
+            kubectl get deployment \
+              --namespace "${NAMESPACE}" \
+              -l "${SELECTOR}" \
+              -o jsonpath='{.items[0].metadata.name}'
+          )"
+
+          if [ -z "${DEPLOYMENT_NAME}" ]; then
+            echo "::error::ExternalDNS Deployment was not found."
+            exit 1
+          fi
+
+          echo "ExternalDNS Deployment: ${DEPLOYMENT_NAME}"
+
+          kubectl rollout status \
+            deployment/"${DEPLOYMENT_NAME}" \
+            --namespace "${NAMESPACE}" \
+            --timeout=180s
+
+          POD_NAME="$(
+            kubectl get pods \
+              --namespace "${NAMESPACE}" \
+              -l "${SELECTOR}" \
+              --sort-by=.metadata.creationTimestamp \
+              -o jsonpath='{.items[-1].metadata.name}'
+          )"
+
+          if [ -z "${POD_NAME}" ]; then
+            echo "::error::ExternalDNS Pod was not found."
+            exit 1
+          fi
+
+          CURRENT_SERVICE_ACCOUNT="$(
+            kubectl get pod \
+              "${POD_NAME}" \
+              --namespace "${NAMESPACE}" \
+              -o jsonpath='{.spec.serviceAccountName}'
+          )"
+
+          if [ "${CURRENT_SERVICE_ACCOUNT}" != "${SERVICE_ACCOUNT}" ]; then
+            echo "::error::Unexpected ExternalDNS ServiceAccount."
+            echo "Expected: ${SERVICE_ACCOUNT}"
+            echo "Actual: ${CURRENT_SERVICE_ACCOUNT}"
+            exit 1
+          fi
+
+          POD_PHASE="$(
+            kubectl get pod \
+              "${POD_NAME}" \
+              --namespace "${NAMESPACE}" \
+              -o jsonpath='{.status.phase}'
+          )"
+
+          if [ "${POD_PHASE}" != "Running" ]; then
+            echo "::error::ExternalDNS Pod is not Running."
+            echo "Current phase: ${POD_PHASE}"
+            exit 1
+          fi
+
+          CONTAINER_READY="$(
+            kubectl get pod \
+              "${POD_NAME}" \
+              --namespace "${NAMESPACE}" \
+              -o jsonpath='{.status.containerStatuses[0].ready}'
+          )"
+
+          if [ "${CONTAINER_READY}" != "true" ]; then
+            echo "::error::ExternalDNS container is not Ready."
+            exit 1
+          fi
+
+          ENVIRONMENT_VARIABLE_NAMES="$(
+            kubectl get pod \
+              "${POD_NAME}" \
+              --namespace "${NAMESPACE}" \
+              -o jsonpath='{range .spec.containers[*].env[*]}{.name}{"\n"}{end}'
+          )"
+
+          if ! grep -qx "AWS_CONTAINER_CREDENTIALS_FULL_URI" <<< "${ENVIRONMENT_VARIABLE_NAMES}"; then
+            echo "::error::AWS_CONTAINER_CREDENTIALS_FULL_URI was not injected."
+            exit 1
+          fi
+
+          if ! grep -qx "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE" <<< "${ENVIRONMENT_VARIABLE_NAMES}"; then
+            echo "::error::AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE was not injected."
+            exit 1
+          fi
+
+          echo "ExternalDNS Deployment:"
+          kubectl get deployment \
+            "${DEPLOYMENT_NAME}" \
+            --namespace "${NAMESPACE}"
+
+          echo "ExternalDNS Pod:"
+          kubectl get pod \
+            "${POD_NAME}" \
+            --namespace "${NAMESPACE}" \
+            -o wide
+
+          echo "ExternalDNS ServiceAccount:"
+          kubectl get serviceaccount \
+            "${SERVICE_ACCOUNT}" \
+            --namespace "${NAMESPACE}"
+
+          echo "ExternalDNS image:"
+          kubectl get pod \
+            "${POD_NAME}" \
+            --namespace "${NAMESPACE}" \
+            -o jsonpath='{.spec.containers[0].image}{"\n"}'
+
+          echo "ExternalDNS verification completed successfully."
+
+      # ==========================================================
+      # VERIFY METRICS SERVER
+      # ==========================================================
+
+      - name: Verify Metrics Server
+        if: inputs.operation == 'apply'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for the Metrics Server EKS add-on..."
+
+          aws eks wait addon-active \
+            --cluster-name "${EKS_CLUSTER_NAME}" \
+            --addon-name metrics-server \
+            --region "${AWS_REGION}"
+
+          ADDON_STATUS="$(
+            aws eks describe-addon \
+              --cluster-name "${EKS_CLUSTER_NAME}" \
+              --addon-name metrics-server \
+              --region "${AWS_REGION}" \
+              --query 'addon.status' \
+              --output text
+          )"
+
+          ADDON_VERSION="$(
+            aws eks describe-addon \
+              --cluster-name "${EKS_CLUSTER_NAME}" \
+              --addon-name metrics-server \
+              --region "${AWS_REGION}" \
+              --query 'addon.addonVersion' \
+              --output text
+          )"
+
+          if [ "${ADDON_STATUS}" != "ACTIVE" ]; then
+            echo "::error::Metrics Server add-on status is ${ADDON_STATUS}."
+            exit 1
+          fi
+
+          echo "Metrics Server add-on is active."
+          echo "Metrics Server version: ${ADDON_VERSION}"
+
+          echo "Waiting for the Kubernetes Metrics API..."
+
+          for ATTEMPT in {1..30}; do
+            if kubectl get --raw "/apis/metrics.k8s.io/v1beta1/nodes" \
+              > /dev/null 2>&1; then
+              echo "The Kubernetes Metrics API is available."
+              break
+            fi
+
+            if [ "${ATTEMPT}" -eq 30 ]; then
+              echo "::error::The Kubernetes Metrics API did not become available."
+
+              kubectl get apiservice \
+                v1beta1.metrics.k8s.io \
+                --output wide || true
+
+              kubectl get deployments,pods \
+                --namespace kube-system \
+                --output wide || true
+
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          echo "Verifying node resource metrics..."
+
+          kubectl top nodes
+
+      # ==========================================================
+      # VERIFY CLOUDWATCH OBSERVABILITY
+      # ==========================================================
+
+      - name: Verify CloudWatch Observability
+        if: inputs.operation == 'apply'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ADDON_STATUS="$(
+            aws eks describe-addon \
+              --cluster-name "${EKS_CLUSTER_NAME}" \
+              --addon-name amazon-cloudwatch-observability \
+              --region "${AWS_REGION}" \
+              --query "addon.status" \
+              --output text
+          )"
+
+          if [ "${ADDON_STATUS}" != "ACTIVE" ]; then
+            echo "CloudWatch Observability add-on is not active."
+            echo "Current status: ${ADDON_STATUS}"
+            exit 1
+          fi
+
+          kubectl get pods \
+            --namespace amazon-cloudwatch
+
+          echo "CloudWatch Observability add-on status: ${ADDON_STATUS}"
+
+      - name: Show Terraform outputs
+        if: inputs.operation == 'apply'
+        working-directory: ${{ env.PLATFORM_TF_WORKING_DIRECTORY }}
+        run: terraform output

@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${KUBERNETES_APP_NAME}
+  namespace: ${APPLICATION_NAMESPACE}
+  labels:
+    app: ${KUBERNETES_APP_NAME}
+    app.kubernetes.io/name: ${KUBERNETES_APP_NAME}
+    app.kubernetes.io/part-of: ${KUBERNETES_APP_NAME}
+spec:
+  replicas: 2
+  minReadySeconds: 10
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+
+  selector:
+    matchLabels:
+      app: ${KUBERNETES_APP_NAME}
+
+  template:
+    metadata:
+      labels:
+        app: ${KUBERNETES_APP_NAME}
+        app.kubernetes.io/name: ${KUBERNETES_APP_NAME}
+        app.kubernetes.io/part-of: ${KUBERNETES_APP_NAME}
+
+    spec:
+      serviceAccountName: ${APPLICATION_SERVICE_ACCOUNT}
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: application
+          image: ${IMAGE_URI}
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+
+          envFrom:
+            - secretRef:
+                name: ${KUBERNETES_APP_NAME}-secrets
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            failureThreshold: 30
+            periodSeconds: 10
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          volumeMounts:
+            - name: secrets-store-inline
+              mountPath: /mnt/secrets-store
+              readOnly: true
+
+      volumes:
+        - name: secrets-store-inline
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: ${KUBERNETES_APP_NAME}-secrets

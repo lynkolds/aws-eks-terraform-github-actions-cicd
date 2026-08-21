@@ -1,0 +1,165 @@
+name: Build and Push Docker Image
+
+run-name: Build and push image — ${{ inputs.image_tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Docker image tag
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  # Allows GitHub to generate an OIDC token for AWS authentication.
+  id-token: write
+
+  # Allows the workflow to check out the repository.
+  contents: read
+
+concurrency:
+  group: docker-image-build
+  cancel-in-progress: false
+
+jobs:
+  build_and_push_image:
+    name: Build and Push Application Image
+
+    # Uses the same GitHub Environment as the foundation workflow.
+    environment: dev #edit with your environment name
+
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+
+      # This must match the ECR repository name created by Terraform.
+      ECR_REPOSITORY_NAME: ${{ vars.ECR_REPOSITORY_NAME }}
+
+      # Change this when the Dockerfile is located elsewhere.
+      DOCKERFILE_PATH: rentzone/Dockerfile
+      # Directory containing the application and Dockerfile.
+      DOCKER_BUILD_CONTEXT: .
+
+    steps:
+      
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+
+      # ----------------------------------------------------------
+      # Authenticate to AWS using GitHub OIDC
+      # ----------------------------------------------------------
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYMENT_ROLE_ARN }}
+          role-session-name: github-image-build-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr_login
+        uses: aws-actions/amazon-ecr-login@v2
+
+
+      # ----------------------------------------------------------
+      # Determine the image tag
+      # ----------------------------------------------------------
+
+      # If a manual image tag is supplied, use it.
+      #
+      # Otherwise, use the Git commit SHA so every image is uniquely
+      # associated with a specific version of the application code.
+      - name: Determine image tag
+        id: image
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            IMAGE_TAG="${{ inputs.image_tag }}"
+          else
+            IMAGE_TAG="${GITHUB_SHA}"
+          fi
+
+          ECR_REGISTRY="${{ steps.ecr_login.outputs.registry }}"
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY_NAME}:${IMAGE_TAG}"
+
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+          echo "Image tag: ${IMAGE_TAG}"
+          echo "Image URI: ${IMAGE_URI}"
+
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.DOCKER_BUILD_CONTEXT }}
+          file: ${{ env.DOCKERFILE_PATH }}
+
+          push: true
+
+          tags: |
+            ${{ steps.image.outputs.image_uri }}
+
+          # Reuses previous image layers when possible.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+          # Produces an image suitable for standard x86_64 EKS nodes.
+          platforms: linux/amd64
+
+
+      # ----------------------------------------------------------
+      # Confirm the image exists in ECR
+      # ----------------------------------------------------------
+
+      - name: Verify image in ECR
+        shell: bash
+        run: |
+          aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY_NAME}" \
+            --image-ids imageTag="${{ steps.image.outputs.image_tag }}" \
+            --region "${AWS_REGION}"
+
+
+      # ----------------------------------------------------------
+      # Display the image information
+      # ----------------------------------------------------------
+
+      - name: Show image details
+        run: |
+          echo "ECR repository:"
+          echo "${ECR_REPOSITORY_NAME}"
+
+          echo ""
+          echo "Image tag:"
+          echo "${{ steps.image.outputs.image_tag }}"
+
+          echo ""
+          echo "Complete image URI:"
+          echo "${{ steps.image.outputs.image_uri }}"
+
+
+      # ----------------------------------------------------------
+      # Save the image URI as a workflow artifact
+      # ----------------------------------------------------------
+
+      # This gives you a downloadable text file containing the exact
+      # image URI produced by this workflow.
+      - name: Save image URI
+        shell: bash
+        run: |
+          echo "${{ steps.image.outputs.image_uri }}" > image-uri.txt
+
+      - name: Upload image URI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-image-uri
+          path: image-uri.txt
+          retention-days: 30

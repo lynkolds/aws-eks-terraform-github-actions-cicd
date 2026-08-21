@@ -1,0 +1,35 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ${KUBERNETES_APP_NAME}
+  namespace: ${APPLICATION_NAMESPACE}
+  labels:
+    app: ${KUBERNETES_APP_NAME}
+    app.kubernetes.io/name: ${KUBERNETES_APP_NAME}
+    app.kubernetes.io/part-of: ${KUBERNETES_APP_NAME}
+
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/certificate-arn: "${CERTIFICATE_ARN}"
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    alb.ingress.kubernetes.io/success-codes: "200-399"
+    external-dns.alpha.kubernetes.io/hostname: "${DOMAIN_NAME}"
+
+spec:
+  ingressClassName: alb
+
+  rules:
+    - host: ${DOMAIN_NAME}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ${KUBERNETES_APP_NAME}
+                port:
+                  number: 80
